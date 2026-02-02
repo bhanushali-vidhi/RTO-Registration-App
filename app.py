@@ -3,11 +3,14 @@ import pandas as pd
 import pdfplumber
 import re
 import io
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="RTO Document Verifier", layout="wide")
+st.set_page_config(page_title="RTO Document Verifier + OCR", layout="wide")
 
 # --- HELPER FUNCTIONS ---
 
@@ -43,19 +46,37 @@ def check_name_match(excel_name, doc_name):
 def extract_text_from_pdf_upload(uploaded_file):
     text_content = ""
     try:
+        # 1. Try Digital Extraction first
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text: text_content += text + "\n"
+        
+        # 2. Check if extraction was successful or if it's a scanned image
+        # If text length is very short, it's likely a scan.
+        if len(text_content.strip()) < 20:
+            uploaded_file.seek(0)  # Reset file pointer
+            # Convert PDF to images (one per page)
+            images = convert_from_bytes(uploaded_file.read())
+            
+            ocr_text_list = []
+            for img in images:
+                # Perform OCR on the image
+                ocr_text_list.append(pytesseract.image_to_string(img))
+            
+            text_content = "\n".join(ocr_text_list)
+            
     except Exception as e:
+        st.error(f"Error processing file: {e}")
         return ""
     return text_content
 
 def parse_document_data(text):
     data = {}
+    low_text = text.lower()
     
     # 1. GLOBAL TEMPORARY CHECK
-    if "temporary" in text.lower():
+    if "temporary" in low_text:
         data['reg_type'] = "Temporary"
         data['vehicle_no'] = "TEMP"
     else:
@@ -70,12 +91,14 @@ def parse_document_data(text):
         perm_pattern = r'\b[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}\b'
         bh_pattern = r'\b[0-9]{2}BH[0-9]{4}[A-Z]{1,2}\b'
         
-        if re.search(perm_pattern, text) or re.search(bh_pattern, text):
+        found_perm = re.search(perm_pattern, text)
+        found_bh = re.search(bh_pattern, text)
+
+        if found_perm or found_bh:
             data['reg_type'] = "Permanent"
-            match = re.search(perm_pattern, text) or re.search(bh_pattern, text)
-            data['vehicle_no'] = match.group(0)
+            data['vehicle_no'] = (found_perm or found_bh).group(0)
         else:
-            if "new" in text.lower():
+            if "new" in low_text:
                 data['vehicle_no'] = "NEW"
                 data['reg_type'] = "Temporary"
             else:
@@ -90,27 +113,17 @@ def parse_document_data(text):
     else:
         data['doc_name'] = None
 
-    # --- 5. FIND DATES (UPDATED FOR "11-Nov-2025") ---
-    
-    # Pattern 1: DD/MM/YYYY or DD-MM-YYYY (e.g., 11/11/2025)
+    # 5. FIND DATES
     numeric_pattern = r'\d{2}[-/]\d{2}[-/]\d{4}'
-    
-    # Pattern 2: DD-Mon-YYYY (e.g., 11-Nov-2025, 05-Oct-2024)
-    # [A-Za-z]{3} looks for 3 letters like Jan, Feb, Nov
     text_month_pattern = r'\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{4}'
-
-    # Combined Pattern: Look for either
     date_pattern = f'(?:{numeric_pattern}|{text_month_pattern})'
     
-    # Priority A: Registration Date
     reg_match = re.search(r'(?:Registration|Regn|Reg\.)\s*Date[:\s]*(' + date_pattern + ')', text, re.IGNORECASE)
     data['reg_date_specific'] = reg_match.group(1) if reg_match else None
 
-    # Priority B: Receipt Date (Updated to catch "Receipt date: 11-Nov-2025")
     rec_match = re.search(r'Receipt\s*date[:\s]*(' + date_pattern + ')', text, re.IGNORECASE)
     data['receipt_date_specific'] = rec_match.group(1) if rec_match else None
 
-    # Priority C: Fallback
     if not data['reg_date_specific'] and not data['receipt_date_specific']:
         any_date = re.search(date_pattern, text)
         data['fallback_date'] = any_date.group(0) if any_date else None
@@ -131,18 +144,18 @@ def analyze_row(row, doc_data):
         return "Approved", "Approve", "None"
 
     if chassis_match and name_is_match and not is_permanent:
-        return ("Uploaded document is temporary registration. Kindly upload VAHAN screenshot/Permanent Registration copy/Tax paid receipt.", 
+        return ("Uploaded document is temporary registration. Kindly upload VAHAN copy.", 
                 "Hold", "TEMP REGISTRATION")
 
     if chassis_match and is_permanent and not name_is_match:
         found_name = doc_data.get('doc_name', 'Unknown')
-        return ("Customer name on DCP doesn't match with customer name on receipt. Please provide relationship proof between them.", 
-                "Hold", f"NAME MISMATCH (Doc: {found_name})")
+        return (f"Name mismatch. Found: {found_name}. Provide relationship proof.", 
+                "Hold", "NAME MISMATCH")
 
     if not chassis_match:
          return "Chassis Number mismatch", "Reject", "CHASSIS MISMATCH"
 
-    return "Verification Failed (Unknown reason)", "Reject", "UNKNOWN ERROR"
+    return "Verification Failed", "Reject", "UNKNOWN ERROR"
 
 def create_colored_excel(df):
     output = io.BytesIO()
@@ -153,9 +166,12 @@ def create_colored_excel(df):
     wb = load_workbook(output)
     ws = wb.active
 
-    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fills = {
+        "Reject": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+        "Ineligible": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+        "Hold": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+        "Approve": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    }
 
     header = {cell.value: i+1 for i, cell in enumerate(ws[1])}
     status_col_idx = header.get('RTO status')
@@ -164,12 +180,8 @@ def create_colored_excel(df):
         for row in range(2, ws.max_row + 1):
             cell = ws.cell(row=row, column=status_col_idx)
             val = str(cell.value).strip()
-            if val in ["Reject", "Ineligible"]:
-                cell.fill = red_fill
-            elif val == "Hold":
-                cell.fill = yellow_fill
-            elif val == "Approve":
-                cell.fill = green_fill
+            if val in fills:
+                cell.fill = fills[val]
     
     output_final = io.BytesIO()
     wb.save(output_final)
@@ -178,24 +190,20 @@ def create_colored_excel(df):
 
 # --- STREAMLIT UI ---
 
-st.title("🚗 Auto-Verification System")
-st.markdown("Upload your **User Data Excel** and your **PDF Documents**.")
+st.title("🚗 Auto-Verification System (OCR Enabled)")
+st.info("This system automatically uses OCR for scanned/non-searchable PDFs.")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.header("1. Upload Excel Data")
-    uploaded_excel = st.file_uploader("Upload your User Input Excel", type=["xlsx", "xls"])
+    uploaded_excel = st.file_uploader("1. Upload Master Excel", type=["xlsx", "xls"])
 
 with col2:
-    st.header("2. Upload Documents")
-    uploaded_pdfs = st.file_uploader("Upload Document PDFs", type=["pdf"], accept_multiple_files=True)
+    uploaded_pdfs = st.file_uploader("2. Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
 
 if st.button("🚀 Run Verification"):
     if uploaded_excel and uploaded_pdfs:
-        with st.spinner("Processing Documents..."):
-            
-            # --- A. PROCESS PDFS ---
+        with st.spinner("Extracting data (OCR may take longer for scanned docs)..."):
             extracted_docs = []
             progress_bar = st.progress(0)
             
@@ -207,90 +215,53 @@ if st.button("🚀 Run Verification"):
                 progress_bar.progress((i + 1) / len(uploaded_pdfs))
             
             df_docs = pd.DataFrame(extracted_docs)
-            st.success(f"Scanned {len(uploaded_pdfs)} files. Found valid data in {len(df_docs)} files.")
 
-            # --- B. LOAD USER EXCEL ---
             try:
                 df_user = pd.read_excel(uploaded_excel)
-            except Exception as e:
-                st.error("❌ Error reading Excel file.")
-                st.stop()
-            
-            df_user.columns = df_user.columns.str.strip()
-            
-            required_columns = ['Chassis number', 'Customer Name']
-            missing_cols = [col for col in required_columns if col not in df_user.columns]
-            
-            if missing_cols:
-                st.error(f"❌ Missing required columns: {missing_cols}")
-                st.stop()
-
-            # --- C. MERGE ---
-            if not df_docs.empty:
-                merged_df = pd.merge(df_user, df_docs, left_on='Chassis number', right_on='doc_chassis', how='left')
-            else:
-                merged_df = df_user.copy()
-                merged_df['doc_chassis'] = None
-
-            # --- D. ANALYZE ---
-            results = []
-            for index, row in merged_df.iterrows():
+                df_user.columns = df_user.columns.str.strip()
                 
-                doc_data = {
-                    'doc_name': row.get('doc_name'),
-                    'doc_chassis': row.get('doc_chassis'),
-                    'reg_type': row.get('reg_type', "Temporary"),
-                    'vehicle_no': row.get('vehicle_no', "Not Found")
-                }
-                
-                # --- DATE LOGIC ---
-                reg_date = row.get('reg_date_specific')
-                receipt_date = row.get('receipt_date_specific')
-                fallback_date = row.get('fallback_date')
+                # Validation
+                required = ['Chassis number', 'Customer Name']
+                if not all(col in df_user.columns for col in required):
+                    st.error(f"Excel must contain: {required}")
+                    st.stop()
 
-                if reg_date and str(reg_date).strip():
-                    final_reg_date = reg_date
-                elif receipt_date and str(receipt_date).strip():
-                    final_reg_date = receipt_date
+                if not df_docs.empty:
+                    merged_df = pd.merge(df_user, df_docs, left_on='Chassis number', right_on='doc_chassis', how='left')
                 else:
-                    final_reg_date = fallback_date
+                    merged_df = df_user.copy()
+                    merged_df['doc_chassis'] = None
 
-                remark, status, error_type = analyze_row(row, doc_data)
-                
-                output_row = {
-                    'Chassis number': row['Chassis number'],
-                    'Customer name': row['Customer Name'],
-                    'Dealer code': row.get('Dealer code', ''),
-                    'Dealer name': row.get('Dealer name', ''),
-                    'Model': row.get('Model', ''),
-                    'Variant description': row.get('Variant description', ''),
-                    'Vehicle status': row.get('Vehicle status', ''),
-                    'MY': row.get('MY', ''),
-                    'VY': row.get('VY', ''),
-                    'Registration date': final_reg_date,
-                    'Receipt date': receipt_date, 
-                    'Permanent / Temporary': row.get('reg_type', ''),
-                    'Vehicle Num': doc_data['vehicle_no'],
-                    'Certificate Attached': 'Yes' if doc_data['doc_chassis'] else 'No',
-                    'RTO status': status,
-                    'Specific Error': error_type,
-                    'Remarks': remark
-                }
-                results.append(output_row)
+                results = []
+                for _, row in merged_df.iterrows():
+                    doc_data = {
+                        'doc_name': row.get('doc_name'),
+                        'doc_chassis': row.get('doc_chassis'),
+                        'reg_type': row.get('reg_type', "Temporary"),
+                        'vehicle_no': row.get('vehicle_no', "Not Found")
+                    }
+                    
+                    final_date = row.get('reg_date_specific') or row.get('receipt_date_specific') or row.get('fallback_date')
+                    remark, status, error_type = analyze_row(row, doc_data)
+                    
+                    results.append({
+                        'Chassis number': row['Chassis number'],
+                        'Customer name': row['Customer Name'],
+                        'Registration date': final_date,
+                        'Vehicle Num': doc_data['vehicle_no'],
+                        'Certificate Attached': 'Yes' if doc_data['doc_chassis'] else 'No',
+                        'RTO status': status,
+                        'Specific Error': error_type,
+                        'Remarks': remark
+                    })
 
-            final_df = pd.DataFrame(results)
+                final_df = pd.DataFrame(results)
+                st.dataframe(final_df)
 
-            st.write("### Verification Results")
-            st.dataframe(final_df)
+                processed_excel = create_colored_excel(final_df)
+                st.download_button("📥 Download Report", processed_excel, "report.xlsx")
 
-            processed_excel = create_colored_excel(final_df)
-            
-            st.download_button(
-                label="📥 Download Colored Excel Report",
-                data=processed_excel,
-                file_name="verification_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
+            except Exception as e:
+                st.error(f"Error: {e}")
     else:
-        st.error("Please upload both the Excel file and the PDF documents.")
+        st.error("Please upload both Excel and PDF files.")

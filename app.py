@@ -46,28 +46,29 @@ def check_name_match(excel_name, doc_name):
 def extract_text_from_pdf_upload(uploaded_file):
     text_content = ""
     try:
-        # 1. Try Digital Extraction first
+        # 1. Try Digital Extraction
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text: text_content += text + "\n"
         
-        # 2. Check if extraction was successful or if it's a scanned image
-        # If text length is very short, it's likely a scan.
-        if len(text_content.strip()) < 20:
-            uploaded_file.seek(0)  # Reset file pointer
-            # Convert PDF to images (one per page)
-            images = convert_from_bytes(uploaded_file.read())
+        # 2. Check if we actually found a Chassis Number
+        chassis_found = re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', text_content)
+        
+        # 3. If no Chassis found, it's likely a scan or bad extraction - Trigger OCR
+        if not chassis_found:
+            uploaded_file.seek(0)
+            # dpi=150 saves memory; thread_count=2 speeds up processing
+            images = convert_from_bytes(uploaded_file.read(), dpi=150)
             
             ocr_text_list = []
             for img in images:
-                # Perform OCR on the image
                 ocr_text_list.append(pytesseract.image_to_string(img))
             
             text_content = "\n".join(ocr_text_list)
             
     except Exception as e:
-        st.error(f"Error processing file: {e}")
+        st.error(f"Error: {e}")
         return ""
     return text_content
 
@@ -265,3 +266,4 @@ if st.button("🚀 Run Verification"):
                 st.error(f"Error: {e}")
     else:
         st.error("Please upload both Excel and PDF files.")
+
